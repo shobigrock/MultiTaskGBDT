@@ -638,12 +638,6 @@ class MTGBDT(MTGBMBase):
         self.gain_threshold = gain_threshold
         self.track_split_gains = track_split_gains
         
-        # 戦略パラメータのみ保持
-        self.weighting_strategy = weighting_strategy
-        self.lambda_weight = lambda_weight
-        self.gain_threshold = gain_threshold
-        self.track_split_gains = track_split_gains
-        
         # 新しいパラメータの検証
         if self.weighting_strategy not in ["mtgbm", "proposed"]:
             raise ValueError(f"Unsupported weighting strategy: {self.weighting_strategy}. Use 'mtgbm' or 'proposed'.")
@@ -888,20 +882,19 @@ class MTGBDT(MTGBMBase):
             if self.normalize_gradients:
                 gradients, hessians = self._normalize_gradients_hessians(gradients, hessians)
             
-            # 現在のイテレーションでの動的重みを生成
-            current_weights = self._get_dynamic_gradient_weights(y_multi.shape[1])
-            
-            # 勾配とヘシアンの加重和を計算
-            ensemble_gradients, ensemble_hessians = self._compute_weighted_ensemble_gradients_hessians(
-                gradients, hessians, current_weights
+            # 木に戦略パラメータを渡して構築
+            tree = MultiTaskDecisionTree(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                min_samples_leaf=self.min_samples_leaf,
+                weighting_strategy=self.weighting_strategy,
+                lambda_weight=self.lambda_weight,
+                gain_threshold=self.gain_threshold,
+                track_gains=self.track_split_gains,
+                random_state=self.random_state
             )
             
-            # デバッグ情報：重みの表示（最初の5回のみ）
-            if i < 5:
-                print(f"  Iteration {i+1}: gradient_weights = {current_weights}")
-            
-            # タスク間の相関を計算
-            task_correlations = self._compute_task_correlations(gradients)
+            tree.fit(X, gradients, hessians)
             
             # サブサンプリング
             if self.subsample < 1.0:
@@ -1261,7 +1254,7 @@ class MTGBDT(MTGBMBase):
     
     def _get_mtgbm_weights(self) -> np.ndarray:
         """
-        MTGBM戦略: λパラメータを用いたランダム反転
+        MTGBM戦略: λと1-λをランダム反転
         
         Returns:
         --------
@@ -1269,63 +1262,256 @@ class MTGBDT(MTGBMBase):
             [λ, 1-λ] または [1-λ, λ] の重み
         """
         base_weights = np.array([self.lambda_weight, 1 - self.lambda_weight])
-        
-        # 50%の確率で反転
         if np.random.random() < 0.5:
-            weights = base_weights[::-1]  # [1-λ, λ]
-            switched = True
-        else:
-            weights = base_weights  # [λ, 1-λ]
-            switched = False
-        
-        # 重み切り替えの記録
-        if self.track_split_gains:
-            self.weight_switches.append({
-                'strategy': 'mtgbm',
-                'weights': weights.copy(),
-                'switched': switched,
-                'reason': 'random'
-            })
-        
-        return weights
+            return base_weights[::-1]  # [1-λ, λ]
+        return base_weights  # [λ, 1-λ]
     
-    def _get_proposed_weights(self, current_gain: float = None) -> np.ndarray:
-        """
-        提案戦略: 情報利得ベースの適応的重み
+    def _update_weights_by_strategy(self, current_gain):
+        """戦略に応じた重み更新"""
+        weight_switched = False
         
-        Parameters:
-        -----------
-        current_gain : float, optional
-            現在の情報利得
+        if self.weighting_strategy == "mtgbm":
+            # MTGBM: ランダム反転
+            new_weights = self._get_mtgbm_weights()
+            weight_switched = not np.array_equal(new_weights, self.current_weights)
             
+        elif self.weighting_strategy == "proposed":
+            # 提案手法: 利得閾値に基づく反転
+            if current_gain < self.gain_threshold:
+                new_weights = self.current_weights[::-1]  # 反転
+                weight_switched = True
+            else:
+                new_weights = self.current_weights.copy()  # 維持
+        else:
+            new_weights = self.current_weights.copy()
+        
+        return new_weights, weight_switched
+    
+    def _compute_split_gain_with_weights(self, node_indices, gradients, hessians, 
+                                       feature_idx, threshold, weights):
+        """重み付きアンサンブル勾配での分割利得計算"""
+        # アンサンブル勾配・ヘシアンの計算
+        ensemble_gradients = np.zeros(len(node_indices))
+        ensemble_hessians = np.zeros(len(node_indices))
+        
+        for task_idx in range(2):  # 2タスクのみ
+            ensemble_gradients += weights[task_idx] * gradients[node_indices, task_idx]
+            ensemble_hessians += weights[task_idx] * hessians[node_indices, task_idx]
+        
+        # 分割
+        feature_values = self.X[node_indices, feature_idx]
+        left_mask = feature_values <= threshold
+        right_mask = ~left_mask
+        
+        if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
+            return -float('inf')
+        
+        # XGBoost式利得計算
+        G = np.sum(ensemble_gradients)
+        H = np.sum(ensemble_hessians)
+        G_L = np.sum(ensemble_gradients[left_mask])
+        H_L = np.sum(ensemble_hessians[left_mask])
+        G_R = np.sum(ensemble_gradients[right_mask])
+        H_R = np.sum(ensemble_hessians[right_mask])
+        
+        if H_L <= 0 or H_R <= 0 or H <= 0:
+            return -float('inf')
+        
+        gain = 0.5 * (
+            (G_L ** 2) / (H_L + self.reg_lambda) +
+            (G_R ** 2) / (H_R + self.reg_lambda) -
+            (G ** 2) / (H + self.reg_lambda)
+        )
+        
+        return gain
+    
+    def _record_split_attempt(self, depth, feature_idx, threshold, temp_gain, 
+                            final_gain, old_weights, new_weights, switched):
+        """分割試行の履歴記録"""
+        if self.split_gains_history is not None:
+            self.split_gains_history.append({
+                'depth': depth,
+                'feature': feature_idx,
+                'threshold': threshold,
+                'temp_gain': temp_gain,
+                'final_gain': final_gain,
+                'weights_before': old_weights,
+                'weights_after': new_weights,
+                'weight_switched': switched
+            })
+    
+    def _find_best_split_with_adaptive_weights(self, node_indices, gradients, hessians, depth):
+        """適応的重み付きの分割探索"""
+        best_gain = -float('inf')
+        best_split_info = None
+        
+        for feature_idx in range(self.n_features):
+            # 分割候補の取得
+            feature_values = self.X[node_indices, feature_idx]
+            unique_values = np.unique(feature_values)
+            
+            for i in range(len(unique_values) - 1):
+                threshold = (unique_values[i] + unique_values[i + 1]) / 2
+                
+                # Step 1: 現在の重みで仮の利得計算
+                temp_gain = self._compute_split_gain_with_weights(
+                    node_indices, gradients, hessians, feature_idx, threshold, 
+                    self.current_weights
+                )
+                
+                # Step 2: 戦略に応じた重み更新
+                updated_weights, weight_switched = self._update_weights_by_strategy(temp_gain)
+                
+                # Step 3: 更新された重みで最終利得計算
+                final_gain = self._compute_split_gain_with_weights(
+                    node_indices, gradients, hessians, feature_idx, threshold,
+                    updated_weights
+                )
+                
+                # Step 4: 履歴記録
+                if self.track_gains:
+                    self._record_split_attempt(
+                        depth, feature_idx, threshold, temp_gain, final_gain,
+                        self.current_weights.copy(), updated_weights.copy(), weight_switched
+                    )
+                
+                # Step 5: 最適分割更新
+                if final_gain > best_gain:
+                    best_gain = final_gain
+                    best_split_info = {
+                        'feature': feature_idx,
+                        'threshold': threshold,
+                        'gain': final_gain,
+                        'weights_used': updated_weights.copy()
+                    }
+                    # 採用された重みで current_weights を更新
+                    self.current_weights = updated_weights.copy()
+        
+        return best_split_info
+    
+    def _build_tree_with_adaptive_weights(self, node_indices, gradients, hessians, depth=0):
+        """
+        各分岐で適応的重み決定を行う再帰的木構築
+        """
+        # 停止条件チェック
+        if (depth >= self.max_depth or 
+            len(node_indices) < self.min_samples_split or
+            len(node_indices) < 2 * self.min_samples_leaf):
+            return self._create_leaf_node(node_indices, gradients, hessians)
+        
+        # 適応的重み付き分割探索
+        best_split_info = self._find_best_split_with_adaptive_weights(
+            node_indices, gradients, hessians, depth
+        )
+        
+        if best_split_info is None or best_split_info['gain'] <= 0:
+            return self._create_leaf_node(node_indices, gradients, hessians)
+        
+        # 分割実行
+        feature_values = self.X[node_indices, best_split_info['feature']]
+        left_mask = feature_values <= best_split_info['threshold']
+        
+        left_indices = node_indices[left_mask]
+        right_indices = node_indices[~left_mask]
+        
+        if len(left_indices) < self.min_samples_leaf or len(right_indices) < self.min_samples_leaf:
+            return self._create_leaf_node(node_indices, gradients, hessians)
+        
+        # 再帰的に子ノード構築
+        left_child = self._build_tree_with_adaptive_weights(left_indices, gradients, hessians, depth + 1)
+        right_child = self._build_tree_with_adaptive_weights(right_indices, gradients, hessians, depth + 1)
+        
+        return DecisionTreeNode(
+            feature_idx=best_split_info['feature'],
+            threshold=best_split_info['threshold'],
+            left=left_child,
+            right=right_child
+        )
+    
+    def _create_leaf_node(self, node_indices, gradients, hessians):
+        """
+        リーフノードを作成（各タスクの予測値を計算）
+        """
+        n_tasks = gradients.shape[1]
+        leaf_values = np.zeros(n_tasks)
+        
+        for task_idx in range(n_tasks):
+            G = np.sum(gradients[node_indices, task_idx])
+            H = np.sum(hessians[node_indices, task_idx])
+            
+            if H > 0:
+                leaf_values[task_idx] = -G / (H + self.reg_lambda)
+            else:
+                leaf_values[task_idx] = 0.0
+        
+        return DecisionTreeNode(values=leaf_values)
+    
+    def get_split_gain_analysis(self) -> dict:
+        """
+        分割利得の詳細分析を取得
+        
         Returns:
         --------
-        weights : array-like, shape=(2,)
-            適応的に決定された重み
+        analysis : dict
+            分割利得の詳細分析情報
         """
-        # 初回または利得情報がない場合は基本重み
-        if not hasattr(self, '_current_weights') or current_gain is None:
-            self._current_weights = np.array([self.lambda_weight, 1 - self.lambda_weight])
-            switched = False
-            reason = 'initial'
-        else:
-            # 利得が閾値を下回る場合は反転
-            if current_gain < self.gain_threshold:
-                self._current_weights = self._current_weights[::-1]
-                switched = True
-                reason = f'gain_below_threshold({current_gain:.6f} < {self.gain_threshold})'
-            else:
-                switched = False
-                reason = f'gain_above_threshold({current_gain:.6f} >= {self.gain_threshold})'
+        if not self.track_split_gains:
+            return {"error": "split gain tracking is disabled"}
         
-        # 重み切り替えの記録
-        if self.track_split_gains:
-            self.weight_switches.append({
-                'strategy': 'proposed',
-                'weights': self._current_weights.copy(),
-                'switched': switched,
-                'reason': reason,
-                'gain': current_gain
-            })
+        all_gains = []
+        all_temp_gains = []
+        all_switches = []
+        iteration_stats = []
         
-        return self._current_weights.copy()
+        for tree_info in self.trees:
+            tree = tree_info['tree']
+            if hasattr(tree, 'split_gains_history') and tree.split_gains_history:
+                tree_gains = [g['final_gain'] for g in tree.split_gains_history]
+                tree_temp_gains = [g['temp_gain'] for g in tree.split_gains_history]
+                tree_switches = [g['weight_switched'] for g in tree.split_gains_history]
+                
+                all_gains.extend(tree_gains)
+                all_temp_gains.extend(tree_temp_gains)
+                all_switches.extend(tree_switches)
+                
+                # イテレーション統計
+                iteration_stats.append({
+                    'num_splits': len(tree_gains),
+                    'gain_mean': np.mean(tree_gains) if tree_gains else 0,
+                    'gain_std': np.std(tree_gains) if tree_gains else 0,
+                    'weight_switches': np.sum(tree_switches),
+                    'switch_rate': np.mean(tree_switches) if tree_switches else 0
+                })
+        
+        if not all_gains:
+            return {"error": "no split gain data available"}
+        
+        return {
+            'gain_distribution': {
+                'count': len(all_gains),
+                'mean': np.mean(all_gains),
+                'std': np.std(all_gains),
+                'min': np.min(all_gains),
+                'max': np.max(all_gains),
+                'percentiles': {
+                    '25%': np.percentile(all_gains, 25),
+                    '50%': np.percentile(all_gains, 50),
+                    '75%': np.percentile(all_gains, 75),
+                    '90%': np.percentile(all_gains, 90),
+                    '95%': np.percentile(all_gains, 95)
+                }
+            },
+            'temp_gain_distribution': {
+                'mean': np.mean(all_temp_gains),
+                'std': np.std(all_temp_gains),
+                'min': np.min(all_temp_gains),
+                'max': np.max(all_temp_gains)
+            },
+            'weight_switch_summary': {
+                'total_switches': np.sum(all_switches),
+                'total_splits': len(all_switches),
+                'overall_switch_rate': np.mean(all_switches),
+                'avg_switches_per_tree': np.mean([s['weight_switches'] for s in iteration_stats])
+            },
+            'iteration_stats': iteration_stats
+        }
