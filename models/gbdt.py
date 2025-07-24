@@ -216,17 +216,27 @@ class MultiTaskDecisionTree:
         gamma_limited = min(self.gamma, 10.0)  # ガンマ値を制限して数値安定性を向上
         
         ensemble_gradients = raw_gradients.copy()
+        
+        # 乱数を用いて強調タスクを決定（CVR=0, CTR=1）
         if self.weighting_strategy == "mtgbm":
-            # 乱数を用いて強調タスクを決定（CVR=0, CTR=1）
             emphasis_task = np.random.choice([0, 1])
             if emphasis_task == 0:  # CVR強調
                 ensemble_gradients[:, 0] *= gamma_limited
             else:  # CTR強調
                 ensemble_gradients[:, 1] *= gamma_limited
-                
+
+        # CVRタスク（インデックス0）の勾配にgammaを乗算        
         elif self.weighting_strategy == "proposed":
-            # CVRタスク（インデックス0）の勾配にgammaを乗算
             ensemble_gradients[:, 0] *= gamma_limited
+
+        # CTRタスク（インデックス1）の勾配にgammaを乗算
+        elif self.weighting_strategy == "proposed_reverse":
+            ensemble_gradients[:, 1] *= gamma_limited
+        
+        # CVRとCTRの重みを0.5:0.5に設定（均等重み）
+        elif self.weighting_strategy == "half":
+            ensemble_gradients[:, 0] *= 0.5  # CVR
+            ensemble_gradients[:, 1] *= 0.5  # CTR
         
         # ルートノードを作成し、再帰的に木を構築
         # raw_gradients/hessians: 予測値計算用（素の値）
@@ -310,41 +320,6 @@ class MultiTaskDecisionTree:
                 normalized_data[:, task_idx] = (task_data - current_mean) / current_std * target_std + target_mean
         
         return normalized_data
-    
-    
-    def _normalize_weights(self, weights: np.ndarray, mean: float = 0.05, std: float = 0.01) -> np.ndarray:
-        """
-        重みを指定された平均と標準偏差に正規化
-        
-        Parameters:
-        -----------
-        weights : array-like
-            正規化する重み
-        mean : float, default=0.05
-            目標平均値
-        std : float, default=0.01
-            目標標準偏差
-            
-        Returns:
-        --------
-        normalized_weights : array-like
-            正規化された重み
-        """
-        # 現在の平均と標準偏差を計算
-        current_mean = np.mean(weights)
-        current_std = np.std(weights)
-        
-        if current_std == 0:
-            # 全ての重みが同じ場合
-            return np.ones_like(weights) * mean
-        
-        # 正規化
-        normalized = (weights - current_mean) / current_std * std + mean
-        
-        # 負の値を防止
-        normalized = np.maximum(normalized, 1e-6)
-        
-        return normalized
     
     def _build_tree(self, 
                    node: DecisionTreeNode, 
@@ -453,7 +428,38 @@ class MultiTaskDecisionTree:
                     self._log_node_info(node, is_leaf=True, weight_switched=weight_switched)
                     # 葉ノード到達で終了
                     return
+                
+        elif self.weighting_strategy == "proposed_reverse":
+            
+            # 情報利得がdelta閾値を下回る場合、重みを切り替え
+            if best_gain < self.delta:
+                # CTRタスクの勾配を1/gamma倍、CVRタスクの勾配をgamma倍
+                adjusted_ensemble_gradients = ensemble_gradients.copy()
+                adjusted_ensemble_gradients[:, 1] /= self.gamma  # CTR
+                adjusted_ensemble_gradients[:, 0] *= self.gamma  # CVR
+                
+                # 新しいアンサンブル勾配を計算（ヘシアンはそのまま）
+                current_ensemble_gradients = np.sum(adjusted_ensemble_gradients, axis=1)
+                weight_switched = True
+        
+                # 最適な分割を見つける
+                best_gain, best_feature_idx, best_threshold, best_left_indices, best_right_indices = self._search_best_split(
+                    X, current_ensemble_gradients, current_ensemble_hessians
+                )
 
+                # 有効な分割が見つからなかった場合
+                if best_gain <= 0 or best_feature_idx is None:
+                    node.is_leaf = True
+                    # ログに記録
+                    self._log_node_info(node, is_leaf=True, weight_switched=weight_switched)
+                    # 葉ノード到達で終了
+                    return
+
+        # half戦略では動的重み調整を行わない（常に0.5:0.5を維持）
+        elif self.weighting_strategy == "half":
+            # 動的重み調整なし - 常に均等重み
+            pass
+              
         # ノードに分割情報を設定
         node.feature_idx = best_feature_idx
         node.threshold = best_threshold
@@ -835,8 +841,8 @@ class MTGBDT(MTGBMBase):
         self.delta = delta
         
         # 新しいパラメータの検証
-        if self.weighting_strategy not in ["mtgbm", "proposed"]:
-            raise ValueError(f"Unsupported weighting strategy: {self.weighting_strategy}. Use 'mtgbm' or 'proposed'.")
+        if self.weighting_strategy not in ["mtgbm", "proposed", "proposed_reverse", "half"]:
+            raise ValueError(f"Unsupported weighting strategy: {self.weighting_strategy}. Use 'mtgbm', 'proposed', 'proposed_reverse', or 'half'.")
         
         # 履歴記録の初期化
         if self.track_split_gains:
@@ -1946,7 +1952,7 @@ class STGBDT(MTGBMBase):
     
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
-        確率予測（二値分類用）
+        確率予測を行う（logloss用）
         
         Parameters:
         -----------
@@ -1955,7 +1961,7 @@ class STGBDT(MTGBMBase):
             
         Returns:
         --------
-        y_proba : array-like, shape=(n_samples, 2)
+        y_pred_proba : array-like, shape=(n_samples, n_tasks, 2)
             各サンプルの確率予測値（クラス0とクラス1の確率）
         """
         # 通常の予測値をクリッピング（0-1の範囲）
@@ -1963,4 +1969,369 @@ class STGBDT(MTGBMBase):
         y_pred_proba = np.clip(y_pred, 0, 1)
         
         # [1-p, p] の形式で返却（sklearn互換）
-        return np.column_stack([1 - y_pred_proba, y_pred_proba])
+        return np.stack([1 - y_pred_proba, y_pred_proba], axis=-1)
+
+
+class MTRF:
+    """
+    マルチタスクランダムフォレスト（MT-RF）の実装
+    
+    MultiTaskDecisionTreeを弱学習器とするランダムフォレスト。
+    MTGBDTのランダムフォレスト版として、バギング手法を採用。
+    
+    Attributes:
+    -----------
+    n_estimators : int
+        木の数
+    max_depth : int
+        各木の最大深さ
+    min_samples_split : int
+        分割に必要な最小サンプル数
+    min_samples_leaf : int
+        リーフノードに必要な最小サンプル数
+    max_features : str, int, float or None
+        各木で使用する特徴数の指定
+    bootstrap : bool
+        ブートストラップサンプリングを行うかどうか
+    weighting_strategy : str
+        重み戦略（"mtgbm", "proposed", "half"など）
+    gamma : float
+        勾配強調のハイパーパラメータ（proposed戦略用）
+    delta : float
+        動的重み切り替えの情報利得閾値（proposed戦略用）
+    random_state : int or None
+        乱数シード
+    trees : list
+        学習済みの木のリスト
+    initial_predictions : array-like
+        初期予測値（各タスクの平均値）
+    loss : str
+        損失関数の種類
+    """
+    
+    def __init__(self,
+                 n_estimators: int = 100,
+                 max_depth: int = 3,
+                 min_samples_split: int = 2,
+                 min_samples_leaf: int = 1,
+                 max_features: Union[str, int, float, None] = None,
+                 bootstrap: bool = True,
+                 weighting_strategy: str = "mtgbm",
+                 gamma: float = 50.0,
+                 delta: float = 0.5,
+                 loss: str = "logloss",
+                 random_state: Optional[int] = None):
+        """
+        初期化メソッド
+        
+        Parameters:
+        -----------
+        n_estimators : int, default=100
+            木の数
+        max_depth : int, default=3
+            各木の最大深さ
+        min_samples_split : int, default=2
+            分割に必要な最小サンプル数
+        min_samples_leaf : int, default=1
+            リーフノードに必要な最小サンプル数
+        max_features : str, int, float or None, default=None
+            各木で使用する特徴数の指定
+            - None: 全特徴を使用
+            - "sqrt": sqrt(n_features)
+            - "log2": log2(n_features)
+            - int: 指定した数の特徴
+            - float: 指定した割合の特徴
+        bootstrap : bool, default=True
+            ブートストラップサンプリングを行うかどうか
+        weighting_strategy : str, default="mtgbm"
+            重み戦略（"mtgbm", "proposed", "half"など）
+        gamma : float, default=50.0
+            勾配強調のハイパーパラメータ（proposed戦略用）
+        delta : float, default=0.5
+            動的重み切り替えの情報利得閾値（proposed戦略用）
+        loss : str, default="logloss"
+            損失関数の種類（"mse", "logloss"）
+        random_state : int or None, default=None
+            乱数シード
+        """
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.max_features = max_features
+        self.bootstrap = bootstrap
+        self.weighting_strategy = weighting_strategy
+        self.gamma = gamma
+        self.delta = delta
+        self.loss = loss
+        self.random_state = random_state
+        
+        # 学習済みモデルの保存
+        self.trees = []
+        self.initial_predictions = None
+        
+        # 乱数生成器の設定
+        if random_state is not None:
+            np.random.seed(random_state)
+            
+    def _validate_input(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        入力データの検証
+        
+        Parameters:
+        -----------
+        X : array-like
+            入力特徴量
+        y : array-like or None
+            ターゲット値
+            
+        Returns:
+        --------
+        X : array-like
+            検証済み入力特徴量
+        y : array-like or None
+            検証済みターゲット値
+        """
+        X = np.asarray(X)
+        if y is not None:
+            y = np.asarray(y)
+            if len(y.shape) == 1:
+                y = y.reshape(-1, 1)
+            
+        return X, y
+    
+    def _get_n_features_for_tree(self, n_total_features: int) -> int:
+        """
+        各木で使用する特徴数を計算
+        
+        Parameters:
+        -----------
+        n_total_features : int
+            全特徴数
+            
+        Returns:
+        --------
+        n_features : int
+            使用する特徴数
+        """
+        if self.max_features is None:
+            return n_total_features
+        elif self.max_features == "sqrt":
+            return int(np.sqrt(n_total_features))
+        elif self.max_features == "log2":
+            return max(1, int(np.log2(n_total_features)))
+        elif isinstance(self.max_features, int):
+            return min(self.max_features, n_total_features)
+        elif isinstance(self.max_features, float):
+            return max(1, int(self.max_features * n_total_features))
+        else:
+            raise ValueError(f"Invalid max_features: {self.max_features}")
+    
+    def _compute_initial_predictions(self, y_multi: np.ndarray) -> np.ndarray:
+        """
+        初期予測値を計算（各タスクの平均値）
+        
+        Parameters:
+        -----------
+        y_multi : array-like, shape=(n_samples, n_tasks)
+            複数タスクのターゲット値
+            
+        Returns:
+        --------
+        initial_predictions : array-like, shape=(n_tasks,)
+            各タスクの初期予測値
+        """
+        return np.mean(y_multi, axis=0)
+    
+    def _compute_gradients_hessians(self, y_multi: np.ndarray, y_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        勾配とヘシアンを計算
+        
+        Parameters:
+        -----------
+        y_multi : array-like, shape=(n_samples, n_tasks)
+            複数タスクのターゲット値
+        y_pred : array-like, shape=(n_samples, n_tasks)
+            現在の予測値
+            
+        Returns:
+        --------
+        gradients : array-like, shape=(n_samples, n_tasks)
+            勾配
+        hessians : array-like, shape=(n_samples, n_tasks)
+            ヘシアン
+        """
+        if self.loss == "mse":
+            # 平均二乗誤差の場合
+            gradients = y_pred - y_multi  # MSEの勾配
+            hessians = np.ones_like(y_multi)  # MSEのヘシアン
+        
+        elif self.loss == "logloss":
+            # クロスエントロピー損失の場合
+            y_pred_safe = np.clip(y_pred, 1e-7, 1 - 1e-7)  # 数値安定性のため
+            gradients = y_pred_safe - y_multi  # loglossの勾配
+            hessians = y_pred_safe * (1 - y_pred_safe)  # loglossのヘシアン
+        
+        else:
+            raise ValueError(f"Unknown loss function: {self.loss}")
+            
+        return gradients, hessians
+    
+    def fit(self, X: np.ndarray, y_multi: np.ndarray, **kwargs) -> 'MTRF':
+        """
+        マルチタスクランダムフォレストを学習
+        
+        Parameters:
+        -----------
+        X : array-like, shape=(n_samples, n_features)
+            入力特徴量
+        y_multi : array-like, shape=(n_samples, n_tasks)
+            複数タスクのターゲット値
+        **kwargs : dict
+            追加のパラメータ
+            
+        Returns:
+        --------
+        self : MTRF
+            学習済みモデル
+        """
+        # 入力検証
+        X, y_multi = self._validate_input(X, y_multi)
+        
+        # 初期予測値を計算（各タスクの平均値）
+        self.initial_predictions = self._compute_initial_predictions(y_multi)
+        
+        # 初期予測値から勾配・ヘシアンを計算
+        y_pred_initial = np.tile(self.initial_predictions, (X.shape[0], 1))
+        gradients_initial, hessians_initial = self._compute_gradients_hessians(y_multi, y_pred_initial)
+        
+        # タスク間相関の計算（ランダムフォレストでは各木が独立なため、無相関を仮定）
+        n_tasks = y_multi.shape[1]
+        task_correlations = np.eye(n_tasks)
+        
+        # 学習開始時間
+        start_time = time.time()
+        
+        # 各木を学習
+        self.trees = []
+        for i in range(self.n_estimators):
+            # 各木用のサンプリング（ブートストラップ + 特徴選択）
+            n_samples = X.shape[0]
+            
+            # ブートストラップサンプリング
+            if self.bootstrap:
+                sample_indices = np.random.choice(n_samples, size=n_samples, replace=True)
+            else:
+                sample_indices = np.arange(n_samples)
+            
+            # 特徴サンプリング
+            n_features_for_tree = self._get_n_features_for_tree(X.shape[1])
+            feature_indices = np.random.choice(X.shape[1], size=n_features_for_tree, replace=False)
+            
+            # サンプリング実行
+            X_subset = X[np.ix_(sample_indices, feature_indices)]
+            y_subset = y_multi[sample_indices]
+            
+            # この木の重み戦略を決定
+            if self.weighting_strategy == "mtgbm":
+                tree_weight_strategy = np.random.choice(["task1_priority", "task2_priority"])
+            else:
+                tree_weight_strategy = self.weighting_strategy
+            
+            # サブセットでの勾配・ヘシアンを計算
+            y_pred_subset = np.tile(self.initial_predictions, (X_subset.shape[0], 1))
+            gradients_subset, hessians_subset = self._compute_gradients_hessians(y_subset, y_pred_subset)
+            
+            # 木を構築
+            tree = MultiTaskDecisionTree(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                min_samples_leaf=self.min_samples_leaf,
+                weighting_strategy=tree_weight_strategy,
+                gamma=self.gamma,
+                delta=self.delta,
+                random_state=None  # 各木で異なる乱数を使用
+            )
+            
+            # 木を学習
+            tree.fit(
+                X_subset,
+                gradients_subset,
+                hessians_subset,
+                task_correlations=task_correlations,
+                y_true=y_subset
+            )
+            
+            # 木と特徴インデックスを保存
+            self.trees.append({
+                'tree': tree,
+                'feature_indices': feature_indices
+            })
+            
+            # 進捗表示
+            if (i + 1) % 20 == 0 or i == 0 or i == self.n_estimators - 1:
+                elapsed_time = time.time() - start_time
+                print(f"Tree {i+1}/{self.n_estimators} trained, Time: {elapsed_time:.2f}s")
+        
+        return self
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        学習済みモデルで予測
+        
+        Parameters:
+        -----------
+        X : array-like, shape=(n_samples, n_features)
+            入力特徴量
+            
+        Returns:
+        --------
+        y_pred : array-like, shape=(n_samples, n_tasks)
+            各サンプルの予測値（各木の単純平均）
+        """
+        # 入力検証
+        X, _ = self._validate_input(X)
+        
+        if not self.trees:
+            raise ValueError("Model has not been trained yet")
+        
+        # 各木の予測を収集
+        tree_predictions = []
+        
+        for tree_info in self.trees:
+            tree = tree_info['tree']
+            feature_indices = tree_info['feature_indices']
+            
+            # 特徴サブセットで予測
+            X_subset = X[:, feature_indices]
+            pred = tree.predict(X_subset)
+            tree_predictions.append(pred)
+        
+        # 各木の予測の単純平均
+        y_pred = np.mean(tree_predictions, axis=0)
+        
+        # 初期予測値を加算（ランダムフォレストでは通常不要だが、整合性のため）
+        # ただし、木の予測が既に初期予測からの差分ではなく絶対値なので、単純平均のみ
+        
+        return y_pred
+    
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """
+        確率予測を行う（logloss用）
+        
+        Parameters:
+        -----------
+        X : array-like, shape=(n_samples, n_features)
+            入力特徴量
+            
+        Returns:
+        --------
+        y_pred_proba : array-like, shape=(n_samples, n_tasks, 2)
+            各サンプルの確率予測値（クラス0とクラス1の確率）
+        """
+        # 通常の予測値をクリッピング（0-1の範囲）
+        y_pred = self.predict(X)
+        y_pred_proba = np.clip(y_pred, 0, 1)
+        
+        # [1-p, p] の形式で返却（sklearn互換）
+        return np.stack([1 - y_pred_proba, y_pred_proba], axis=-1)
